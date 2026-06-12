@@ -53,3 +53,15 @@ class WassersteinCriticLoss(nn.Module):
         critic_fake: torch.Tensor,
     ) -> torch.Tensor:
         return critic_fake.mean() - critic_real.mean()
+
+
+def critic_hinge_regularizer(critic_out: torch.Tensor, sign: float) -> torch.Tensor:
+    """Keep critic logits near [-1, 1] to avoid unbounded WGAN drift."""
+    return torch.relu(1.0 - sign * critic_out).mean()
+
+
+def clip_critic_weights(critic: nn.Module, clamp: float = 0.01) -> None:
+    """Classic WGAN weight clipping for Lipschitz-like constraint."""
+    with torch.no_grad():
+        for param in critic.parameters():
+            param.clamp_(-clamp, clamp)

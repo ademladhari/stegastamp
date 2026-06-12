@@ -13,7 +13,13 @@ from torch.utils.data import DataLoader
 from stegastamp.config import TrainConfig, perturbation_profile
 from stegastamp.data import MirflickrDataset
 from stegastamp.ecc import BCHCodec
-from stegastamp.losses import LPIPSLoss, ResidualLoss, WassersteinCriticLoss
+from stegastamp.losses import (
+    LPIPSLoss,
+    ResidualLoss,
+    WassersteinCriticLoss,
+    clip_critic_weights,
+    critic_hinge_regularizer,
+)
 from stegastamp.models import StegaStampCritic, StegaStampDecoder, StegaStampEncoder
 from stegastamp.perturbations import PhysicalPerturbationPipeline
 from stegastamp.utils import ensure_dir, get_git_hash, set_seed
@@ -47,6 +53,10 @@ def train(args: argparse.Namespace) -> None:
         lambda_lpips_max=args.lambda_lpips_max,
         lambda_critic_max=args.lambda_critic_max,
         warmup_epochs_decode_only=args.warmup_epochs_decode_only,
+        warmup_epochs_critic=args.warmup_epochs_critic,
+        critic_grad_clip=args.critic_grad_clip,
+        critic_weight_clip=args.critic_weight_clip,
+        critic_hinge_weight=args.critic_hinge_weight,
         perspective_ramp_factor=args.perspective_ramp_factor,
         num_workers=args.num_workers,
         seed=args.seed,
@@ -95,6 +105,7 @@ def train(args: argparse.Namespace) -> None:
         lambda_critic = cfg.lambda_critic_max * ramp
         persp_s = ramp * cfg.perspective_ramp_factor if p_cfg.perspective else 0.0
         other_s = ramp
+        train_critic = epoch >= cfg.warmup_epochs_critic
         for images in dl:
             step += 1
             images = images.to(device)
@@ -114,23 +125,42 @@ def train(args: argparse.Namespace) -> None:
             )
             message_logits = decoder(distorted)
 
-            # Critic step (interleaved)
-            with torch.no_grad():
-                encoded_detached = enc_out.stegastamp.detach()
-            c_real = critic(images)
-            c_fake = critic(encoded_detached)
-            loss_c = critic_loss(c_real, c_fake)
-            opt_c.zero_grad(set_to_none=True)
-            loss_c.backward()
-            opt_c.step()
+            # Critic step (delayed until after warmup to avoid early explosion)
+            loss_c = torch.zeros((), device=device)
+            c_real_mean = 0.0
+            c_fake_mean = 0.0
+            if train_critic:
+                with torch.no_grad():
+                    encoded_detached = enc_out.stegastamp.detach()
+                c_real = critic(images)
+                c_fake = critic(encoded_detached)
+                loss_c = critic_loss(c_real, c_fake)
+                loss_c = loss_c + cfg.critic_hinge_weight * (
+                    critic_hinge_regularizer(c_real, sign=1.0) + critic_hinge_regularizer(c_fake, sign=-1.0)
+                )
+                opt_c.zero_grad(set_to_none=True)
+                loss_c.backward()
+                if cfg.critic_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), cfg.critic_grad_clip)
+                opt_c.step()
+                if cfg.critic_weight_clip > 0:
+                    clip_critic_weights(critic, clamp=cfg.critic_weight_clip)
+                c_real_mean = float(c_real.mean().item())
+                c_fake_mean = float(c_fake.mean().item())
 
             # Encoder/decoder step
-            c_fake_for_gen = critic(enc_out.stegastamp)
             loss_msg = bce(message_logits, messages)
             loss_res = residual_loss(enc_out.residual)
             loss_lp = lpips_loss(enc_out.stegastamp, images)
-            loss_ed = cfg.lambda_message * loss_msg + lambda_residual * loss_res + lambda_lpips * loss_lp + lambda_critic * (
-                -c_fake_for_gen.mean()
+            gen_critic_term = torch.zeros((), device=device)
+            if train_critic and lambda_critic > 0:
+                c_fake_for_gen = critic(enc_out.stegastamp)
+                gen_critic_term = -c_fake_for_gen.mean()
+            loss_ed = (
+                cfg.lambda_message * loss_msg
+                + lambda_residual * loss_res
+                + lambda_lpips * loss_lp
+                + lambda_critic * gen_critic_term
             )
             opt_ed.zero_grad(set_to_none=True)
             loss_ed.backward()
@@ -147,6 +177,9 @@ def train(args: argparse.Namespace) -> None:
                     "loss_res": float(loss_res.item()),
                     "loss_lpips": float(loss_lp.item()),
                     "loss_critic": float(loss_c.item()),
+                    "critic_real_mean": c_real_mean,
+                    "critic_fake_mean": c_fake_mean,
+                    "critic_active": float(train_critic),
                     "bit_acc": float(bit_acc),
                     "ramp": float(ramp),
                 }
@@ -180,7 +213,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr-encoder-decoder", type=float, default=1e-4)
-    parser.add_argument("--lr-critic", type=float, default=1e-4)
+    parser.add_argument("--lr-critic", type=float, default=1e-5)
+    parser.add_argument("--warmup-epochs-critic", type=int, default=3)
+    parser.add_argument("--critic-grad-clip", type=float, default=1.0)
+    parser.add_argument("--critic-weight-clip", type=float, default=0.01)
+    parser.add_argument("--critic-hinge-weight", type=float, default=0.5)
     parser.add_argument("--lambda-message", type=float, default=1.0)
     parser.add_argument("--lambda-residual-max", type=float, default=2.0)
     parser.add_argument("--lambda-lpips-max", type=float, default=1.0)

@@ -25,6 +25,10 @@ class TrainConfig:
     lambda_lpips_max: float = 1.0
     lambda_critic_max: float = 0.1
     warmup_epochs_decode_only: int = 3
+    warmup_epochs_critic: int = 3
+    critic_grad_clip: float = 1.0
+    critic_weight_clip: float = 0.01
+    critic_hinge_weight: float = 0.5
     perspective_ramp_factor: float = 0.6
     num_workers: int = 2
     seed: int = 42
